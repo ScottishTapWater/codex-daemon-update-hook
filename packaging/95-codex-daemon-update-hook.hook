@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = openai-codex
+
+[Action]
+Description = Synchronising configured Codex daemon packages...
+When = PostTransaction
+Depends = systemd
+Depends = procps-ng
+Exec = /usr/lib/codex-daemon-update-hook/update

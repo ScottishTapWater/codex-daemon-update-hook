@@ -1,0 +1,3 @@
+# One participating username per line. Blank lines and comments are allowed.
+# No accounts are enabled by default. For example, uncomment the next line:
+# alice

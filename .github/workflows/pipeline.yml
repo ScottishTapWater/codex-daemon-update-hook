@@ -1,0 +1,88 @@
+name: CI and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate hook and Arch package
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install validation tools
+        run: pacman -Syu --noconfirm base-devel git python shellcheck systemd procps-ng
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check scripts and behaviour
+        run: |
+          bash -n src/update
+          shellcheck src/update scripts/*.sh tests/*.sh
+          python -m unittest discover -s tests -v
+      - name: Build package without root
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- scripts/package.sh 0.1.0
+          runuser -u builder -- bash -c 'cd build && makepkg --force --nodeps --noconfirm'
+          tests/check-package.sh build/*.pkg.tar.zst
+      - name: Check configuration preservation in this disposable container
+        run: |
+          pacman -U --noconfirm --nodeps build/*.pkg.tar.zst
+          printf '# retained local configuration\n' >> /etc/codex-daemon-update-hook/users
+          cp /etc/codex-daemon-update-hook/users /tmp/expected-users
+          pacman -U --noconfirm --nodeps build/*.pkg.tar.zst
+          cmp /tmp/expected-users /etc/codex-daemon-update-hook/users
+
+  release:
+    name: Release and publish to AUR
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip release]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Calculate semantic version
+        id: version
+        run: echo "version=$(python3 scripts/version.py)" >> "$GITHUB_OUTPUT"
+      - name: Prepare release archive and AUR metadata
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          docker run --rm -e VERSION -v "$PWD:/work" -w /work archlinux:latest bash -euc '
+            pacman -Syu --noconfirm base-devel git
+            useradd -m builder
+            chown -R builder:builder /work
+            runuser -u builder -- scripts/package.sh "$VERSION"
+            runuser -u builder -- bash -c "cd build && makepkg --force --nodeps --noconfirm"
+            tests/check-package.sh build/*.pkg.tar.zst
+          '
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "codex-daemon-update-hook v$VERSION" --generate-notes \
+            "build/codex-daemon-update-hook-$VERSION.tar.gz" build/PKGBUILD build/.SRCINFO
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
+        with:
+          pkgname: codex-daemon-update-hook
+          pkgbuild: ./build/PKGBUILD
+          assets: ./build/.SRCINFO
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: Update to v${{ steps.version.outputs.version }}
